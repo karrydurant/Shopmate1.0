@@ -196,6 +196,14 @@ List<Chunk> sentenceChunks(List<Section> sections, String source, String stem,
 }
 ```
 
+## small-to-big
+
+用小子块检索，用大父块喂给 LLM。
+
+一个父节下可能有好几个子块都被命中了。如果按子块直接拼，父节文本会重复出现好几次。实际做法是：同父节只注入一次父块全文，不管几个子块命中它。
+
+凑出来的上下文超 token 预算了，不是从中间砍一半，而是按分数从低到高整块丢父块，直到塞得下。这样不会出现一条知识被砍成半句话的情况。
+
 ## 多路召回融合——Fusion
 
 两种融合方式：RRF、weighted
@@ -419,6 +427,8 @@ fused = 0.5 * recall      // 粗排融合分（组内归一）
       + 0.35 * sem        // query 和「标题+正文」的字符 bigram 余弦
       + 0.15 * title;     // query 和「小节标题」的 bigram 余弦
 ```
+
+## 接地校验
 
 ## 问题
 
