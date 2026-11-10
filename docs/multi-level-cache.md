@@ -2,7 +2,7 @@
 
 ## 读取——ProductDetailService
 
-商品详情读取服务——四级缓存+穿透/击穿/雪崩防护
+商品详情读取服务——多级缓存+穿透/击穿/雪崩防护
 
 ### 读主入口——getProductDetail
 
@@ -69,6 +69,10 @@ public ProductDetailVO getProductDetail(Long productId) {
         }
     }
 }
+```
+
+```java
+
 ```
 
 ## 写入——ProductWriteService
