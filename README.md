@@ -6,4 +6,6 @@
 
 ## [订单库存](docs/order.md)
 
+## [优惠券](docs/coupon.md)
+
 # RAG 检索部分还差一点完成
