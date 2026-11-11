@@ -6,7 +6,7 @@
 
 ```java
 // 创建订单：幂等防重+锁定库存
-// 两层幂等：requestId 挡重复请求、orderNo 唯一索引(user_id, request_id)兜底防重复落单
+// 两层幂等：requestId 挡重复请求、唯一索引(user_id, request_id)兜底防重复落单
 // 兜底靠的是唯一索引的机制
 @Transactional(rollbackFor = Exception.class)
 public Order createOrder(Order order, List<OrderItem> items, String requestId) {
@@ -141,6 +141,104 @@ public Order createOrder(Order order, List<OrderItem> items, String requestId) {
     log.info("[Order] created | orderNo={} | userId={} | amount={}",
             order.getOrderNo(), order.getUserId(), order.getPayAmount());
     return order;
+}
+```
+
+### 支付——payOrder
+
+```java
+public Order payOrder(String orderNo) {
+    Order order = getByOrderNo(orderNo);
+
+    // 先裁决：只有「待支付 -> 已支付」能过，并发下唯一
+    transition(order.getId(), OrderStatus.PAID, OPERATOR_USER);
+
+    // 再把锁定库存转为实际扣减（失败即抛，状态变更随之回滚）
+    for (OrderItem item : orderItemsOf(order.getId())) {
+        int affected = skuMapper.deductStock(item.getSkuId(), item.getQuantity());
+        if (affected == 0) {
+            throw BizException.conflict("库存锁定已失效，无法支付: " + item.getProductName());
+        }
+    }
+
+    Order paid = getByOrderNo(orderNo);
+    log.info("[Order] paid | orderNo={} | amount={}", orderNo, paid.getPayAmount());
+    return paid;
+}
+```
+
+### 取消、超时——cancelOrder
+
+```java
+// 取消订单
+@Transactional(rollbackFor = Exception.class)
+public Order cancelOrder(String orderNo, String operator) {
+    // 按单号查订单，不存在抛 404
+    Order order = getByOrderNo(orderNo);
+
+    // 先 CAS 状态：待支付 → 已取消。并发下只有抢到状态的那一个能继续，
+    // 已支付/已取消的单在这里就被状态机拒绝，走不到后面的退券和归还
+    transition(order.getId(), OrderStatus.CANCELLED, operator);
+
+    couponService.returnForOrder(order.getCouponCode(), orderNo);
+
+    // 逐键归还锁定库存
+    for (OrderItem item : orderItemsOf(order.getId())) {
+        int affected = skuMapper.releaseStock(item.getSkuId(), item.getQuantity());
+        if (affected == 0) {
+            // 与支付侧扣减失败相反：这里只记 warn，不抛异常。
+            // 0 行说明这批锁定量已不在账上（重复归还）
+            // 如果抛异常的话会让整个事务回滚，订单状态退回
+            // 超时任务下一轮又会捞到它重试，于是进入一个无法自愈的死循环，所以留痕即可
+            log.warn("[Order] release affected 0 rows | orderNo={} | skuId={} | qty={}",
+                    orderNo, item.getSkuId(), item.getQuantity());
+        }
+    }
+
+    // 重新查库返回取消后的最新订单
+    Order cancelled = getByOrderNo(orderNo);
+    log.info("[Order] cancelled | orderNo={} | locked stock returned", orderNo);
+    return cancelled;
+}
+```
+
+### 未发货退款——refundOrder
+
+```java
+// 退款——状态流转 + 库存回补 + 退券，不碰资金
+// 两次状态流转和回补、退券在同一事务，任一步抛异常，整笔事务一起回滚
+@Transactional(rollbackFor = Exception.class)
+public Order refundOrder(String orderNo) {
+    // 按单号查订单，不存在抛 404
+    Order order = getByOrderNo(orderNo);
+
+    // 先记下退款前的来源状态：下一步 CAS 后状态已变成退款中，就读不到原来的状态了。
+    // 是否回补库存，要靠这个来源状态判断
+    OrderStatus from = OrderStatus.of(order.getStatus());
+
+    // 先 CAS 裁决：只有 未发货/已发货/退货入库 → 退款中 能过，并发下唯一。
+    // 抢到退款中的那一个，才会走到下面的回补和退券
+    transition(order.getId(), OrderStatus.REFUNDING, OPERATOR_ADMIN);
+
+    // 按来源状态决定是否回补库存：
+    //   PAID（未发货）：货没出去，退款时加回可售池，只有这一种会补；
+    //   SHIPPED（仅退款不退货）：货在用户手上，不补；
+    //   RETURNED（已退货入库）：入库时已补过，再补就是重复加
+    if (from == OrderStatus.PAID) {
+        restoreStockOf(order, "refund");
+    }
+
+    // 只有抢到退款中状态的请求会走到这里，券不会被退两次
+    couponService.returnForOrder(order.getCouponCode(), orderNo);
+
+    // 第二步 CAS：退款中 → 已退款。
+    transition(order.getId(), OrderStatus.REFUNDED, OPERATOR_ADMIN);
+
+    // 重新查库返回退款后的最新订单
+    Order refunded = getByOrderNo(orderNo);
+    log.info("[Order] refunded | orderNo={} | amount={} | from={} | restocked={} | no money move",
+            orderNo, refunded.getPayAmount(), from.getDesc(), from == OrderStatus.PAID);
+    return refunded;
 }
 ```
 
@@ -344,6 +442,43 @@ private void registerIdempotencyFinalizer(String key, String orderNo) {
 提交成功 → 事务拦截器调 `afterCommit` → 写最终键；
 
 回滚 → 调 `afterCompletion` 且 `status=ROLLED_BACK` → 删键
+
+### 为什么要设置状态，设置状态有什么用？分别有什么状态？
+
+##### 设置状态到底有什么用？
+
+1.决定库存该怎么动
+
+2.拦截非法操作
+
+状态把 "哪些流转合法" 集中成一张表。比如：已完成的单不能再支付、已取消的单不能再发货、终态不能再流转。没有状态，接口被乱调（重复支付、对已发货单取消）就拦不住。
+
+3.作为并发互斥的裁决点
+
+支付和超时取消会撞车，两者都改 `WHERE status=待支付` 的 CAS，只有一个能成功。状态就是这个互斥锚点
+
+4.驱动流程推进与定时任务
+
+定时任务靠 `status=待支付 + create_time 超时` 扫描回收，售后入口按状态开放（已收货才能申请退货，未发货走退款），前端据此展示待支付、待发货、待收货等环节
+
+5.区分相似业务的不同语义
+
+同样是退款：未发货要回补库存、已发货仅退款不补、退货入库才补。靠退款前的来源状态判断该走哪条库存分支，这也是状态提供的信息。
+
+##### 有哪些状态？
+
+| 枚举名 | 中文状态 | 所处阶段 | 库存含义 |
+|--------|----------|----------|----------|
+| PENDING_PAYMENT | 待支付 | 下单后未付款 | 已锁定库存，尚未实扣 |
+| PAID | 已支付 | 已付款，待发货 | 库存已实扣 |
+| SHIPPED | 已发货 | 商品已发出 | 库存已扣，货在途中 |
+| DELIVERED | 已收货 | 用户已签收 | 库存已扣，等待完成/退货 |
+| COMPLETED | 已完成 | 交易结束 | 终态，不再动库存 |
+| CANCELLED | 已取消 | 订单撤销 | 锁定库存已归还 |
+| REFUNDING | 退款中 | 退款处理中 | 待退款完成 |
+| REFUNDED | 已退款 | 退款完成 | 终态（未发货退款已回补库存） |
+| RETURNING | 退货中 | 退货流程中，货在用户/路上 | 尚未回补库存 |
+| RETURNED | 已退货入库 | 退货商品已入库 | 库存已回补 |
 
 ### 介绍一下这块数据库存储的表的结构？
 
