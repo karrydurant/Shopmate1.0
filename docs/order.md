@@ -204,7 +204,34 @@ WHERE id = #{skuId}
 
 ```sql
 UPDATE product_sku
-SET stock = 
+SET stock = stock - #{n},
+    locked_stock = locked_stock - #{n}
+WHERE id = #{skuId}
+    AND #{n} > 0
+    AND deleted = 0
+    AND locked_stock >= #{n}
+    AND stock >= #{n}
+```
+
+释放锁定——releaseStock
+
+```sql
+UPDATE product_sku
+SET locked_stock = locked_stock - #{n}
+WHERE id = #{skuId}
+  AND #{n} > 0
+  AND deleted = 0
+  AND locked_stock >= #{n}
+```
+
+退款回补——restoreStock
+
+```sql
+UPDATE product_sku
+SET stock = stock + #{n}
+WHERE id = #{skuId}
+  AND #{n} > 0
+  AND deleted = 0
 ```
 
 ## 问题
@@ -224,9 +251,13 @@ WHERE id = #{skuId}
 
 如果 n 是负数，锁定库存就会凭空减少，可售库存莫名增多
 
-### 怎么实现的防超卖？为什么不用分布式锁？
+### 怎么实现的防超卖？
 
-通过 sql 语句而不是分布式锁， 
+防超卖靠的是 "带库存条件的原子 UPDATE + 受影响行数裁决"：把 "库存够不够" 写进 WHERE，数据库行级完成 "判断 + 扣减"，同一行的并发修改由 InnoDB 行锁串行化，没有加分布式锁。
+
+##### 受影响行数裁决在代码中是怎么发挥作用的？
+
+判定成败，替代额外查库。减库存路径拿它当失败信号，0 行就抛异常回滚；还补路径拿它当告警信号，0 行只记 warn 不阻断。
 
 ### 如何实现下单幂等？Redis 和 DB 各自负责什么？
 
@@ -255,4 +286,120 @@ Redis 键里存的 `orderNo` 是一个 "指路牌"：后面再来相同 requestI
 
 5. 再来相同 requestId 的请求，又查不到键、也查不到订单，再建一单—— 幂等就破了。
 
-### 介绍一下 Redis 中的唯一索引？
+##### "最终幂等键在事务提交后才写入"是怎么实现的？简单介绍一下对应的机制？
+
+靠的是 Spring 事务生命周期的回调钩子。
+
+先介绍三个角色：
+
+1.TransactionSynchronizationManager 注册表，Spring 提供的事务同步管理器，内部用 ThreadLocal 把回调列表绑定到当前线程的事务上。业务代码通过它 "登记" 自己想在事务的哪个时间点被通知。事务一开始、代理开启事务后，`TransactionSynchronizationManager` 就把回调列表绑定到当前线程（ThreadLocal），此时 `isSynchronizationActive() = true`。
+
+2.TransactionSynchronization：钩子接口
+
+里面定义了事务各时点的回调方法，重写需要的就行：
+
+| 回调方法 | 触发时机 |
+|---------|---------|
+| `beforeCommit` | 提交前（还能改票 / 参与表决） |
+| `afterCommit` | 提交成功后；回滚不会调 |
+| `beforeCompletion` | 事务结束前 |
+| `afterCompletion` | 事务结束后，无论提交还是回滚都调；用 `status` 判断结果 |
+
+3.事务拦截器(真正触发回调的人)
+
+@Transactional 走的是 Spring 代理。事务拦截器在 `beforeCommit → commit/rollback → afterCommit → beforeCompletion → afterCompletion` 每个节点分别遍历列表调用对应钩子
+
+具体代码实现：
+
+```java
+private void registerIdempotencyFinalizer(String key, String orderNo) {
+    // 当前线程存在事务上下文，才挂钩子；没有事务就不注册
+    if (TransactionSynchronizationManager.isSynchronizationActive()) {
+        // 注册一个同步对象（Hook 实例）
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                // 事务提交成功后：写最终幂等键
+                writeIdempotencyKey(key, orderNo);
+            }
+
+            @Override
+            public void afterCompletion(int status) {
+                // 事务结束后：如果是回滚，删掉占位键
+                if (status == STATUS_ROLLED_BACK) {
+                    redisTemplate.delete(key);
+                }
+            }
+        });
+    }
+}
+```
+
+业务代码在事务内调用 `registerIdempotencyFinalizer`
+
+`registerSynchronization` 把这个匿名 Hook 放进当前线程事务的回调列表
+
+方法返回，代理层继续走 commit /rollback
+
+提交成功 → 事务拦截器调 `afterCommit` → 写最终键；
+
+回滚 → 调 `afterCompletion` 且 `status=ROLLED_BACK` → 删键
+
+### 介绍一下这块数据库存储的表的结构？
+
+##### product_spu 商品 SPU 表
+
+| 字段 | 类型 | 约束/索引 | 说明 |
+|------|------|-----------|------|
+| id | BIGINT | 主键 PK | SPU ID |
+| title | VARCHAR(256) | NOT NULL | 商品标题 |
+| category_id | BIGINT | INDEX idx_category | 品类 ID |
+| brand_id | BIGINT | — | 品牌 ID |
+| description | TEXT | — | 商品描述 |
+| main_image | VARCHAR(512) | — | 主图 URL |
+| status | TINYINT | INDEX idx_status | 0 下架 / 1 上架 |
+| create_time | DATETIME | DEFAULT CURRENT_TIMESTAMP | 创建时间 |
+| update_time | DATETIME | ON UPDATE CURRENT_TIMESTAMP | 更新时间 |
+| deleted | TINYINT(1) | DEFAULT 0 | 逻辑删除 |
+
+##### product_sku 商品 SKU 表
+
+| 字段 | 类型 | 约束/索引 | 说明 |
+|------|------|-----------|------|
+| id | BIGINT | 主键 PK | SKU ID |
+| spu_id | BIGINT | NOT NULL，INDEX idx_spu | 所属 SPU |
+| title | VARCHAR(256) | NOT NULL | SKU 标题 |
+| price | DECIMAL(10,2) | NOT NULL | 售价 |
+| original_price | DECIMAL(10,2) | — | 原价 |
+| stock | INT | DEFAULT 0 | 总库存 |
+| locked_stock | INT | DEFAULT 0 | 锁定库存（下单未支付） |
+| sale_count | INT | DEFAULT 0 | 销量 |
+| image | VARCHAR(512) | — | SKU 图片 |
+| attributes | JSON | — | SKU 规格属性 |
+| create_time | DATETIME | DEFAULT CURRENT_TIMESTAMP | 创建时间 |
+| update_time | DATETIME | ON UPDATE CURRENT_TIMESTAMP | 更新时间 |
+| deleted | TINYINT(1) | DEFAULT 0 | 逻辑删除 |
+| 约束 | — | CHECK chk_sku_stock | stock >= 0 AND locked_stock >= 0 AND locked_stock <= stock |
+| 索引 | — | INDEX idx_price | 按价格筛选 |
+
+##### orders 订单主表
+
+| 字段 | 类型 | 约束/索引 | 说明 |
+|------|------|-----------|------|
+| id | BIGINT | 主键 PK | 订单 ID |
+| order_no | VARCHAR(64) | NOT NULL，UNIQUE uk_order_no | 订单号 |
+| user_id | VARCHAR(64) | NOT NULL，INDEX idx_user_id | 用户 ID |
+| total_amount | DECIMAL(10,2) | NOT NULL | 订单总金额 |
+| discount_amount | DECIMAL(10,2) | DEFAULT 0 | 优惠金额 |
+| pay_amount | DECIMAL(10,2) | NOT NULL | 实付金额 |
+| status | TINYINT | DEFAULT 0 | 0待支付/1已支付/2已发货/3已收货/4完成/5已取消/6退款中/7已退款/8退货中/9已退货入库 |
+| address_snapshot | JSON | — | 地址快照 |
+| coupon_code | VARCHAR(64) | — | 使用的优惠券码 |
+| request_id | VARCHAR(64) | — | 客户端幂等键 |
+| source | VARCHAR(32) | DEFAULT agent_guide | 订单来源 |
+| session_id | VARCHAR(64) | — | 导购会话 ID |
+| create_time | DATETIME | DEFAULT CURRENT_TIMESTAMP | 创建时间 |
+| update_time | DATETIME | ON UPDATE CURRENT_TIMESTAMP | 更新时间 |
+| deleted | TINYINT(1) | DEFAULT 0 | 逻辑删除 |
+| 唯一索引 | — | UNIQUE uk_user_request | (user_id, request_id)，下单幂等兜底 |
+| 联合索引 | — | INDEX idx_status_create_time | (status, create_time)，服务超时扫描 |
