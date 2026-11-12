@@ -4,14 +4,11 @@
 
 ### 领券——acquireCoupon
 
-Redis 预扣 + DB 乐观锁扣减 + 发放；事务回滚时回调补偿 Redis
-
 ```java
-// 领取优惠券：幂等防重 + Redis 预扣 + DB 事务 + 回滚补偿。
-// 一人限领一张；Redis 预扣是前置防线，DB 乐观锁与唯一索引是最终裁决。
 @Transactional(rollbackFor = Exception.class)
 public boolean acquireCoupon(String userId, String couponCode) {
-    // 业务幂等：先查用户券表，已领过直接拒绝（一人一券）
+    // 业务幂等：先查用户券表
+    // 根据条件 WHERE user_id = ? AND coupon_code = ? 查表，返回匹配行数
     Long already = userCouponMapper.selectCount(
             new LambdaQueryWrapper<UserCoupon>()
                     .eq(UserCoupon::getUserId, userId)
@@ -38,10 +35,11 @@ public boolean acquireCoupon(String userId, String couponCode) {
         throw BizException.badParam("优惠券已过期");
     }
 
-    // Redis 库存键不存在时，按 DB 余量用 SETNX 建它；必须在预扣之前
+    // Redis 库存键不存在时，按 DB 余量用 SETNX 创建一个库存键
+    // 这个操作必须在预扣之前
     seedStockFromDbIfAbsent(couponCode, coupon.getRemainingCount());
 
-    // Redis 预扣库存：计数减 1
+    // Redis 预扣库存
     String stockKey = STOCK_KEY_PREFIX + couponCode;
     Long remain = redisTemplate.opsForValue().decrement(stockKey);
     // 减成负数说明已抢光：先把刚减的加回去，再抛异常
@@ -50,7 +48,8 @@ public boolean acquireCoupon(String userId, String couponCode) {
         throw BizException.conflict("优惠券已抢光");
     }
 
-    // 注册事务回调：事务一旦回滚，把 Redis 预扣的库存加回去，并释放幂等键
+    // 注册事务回调：事务一旦回滚，把 Redis 预扣的库存加回去，并释放幂等键（指的是前面的短窗口 Redis 幂等键）
+    // 如果不回调这个键，会导致用户没领到券但 10 s内仍禁止重试，误限流
     // Redis 不参与 JDBC 事务，所以必须靠这个回调与 DB 对齐
     TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
         @Override
@@ -63,10 +62,11 @@ public boolean acquireCoupon(String userId, String couponCode) {
         }
     });
 
-    // DB 乐观锁扣减：带上读到的 version，版本对不上则 0 行；不重复查库
+    // DB 乐观锁扣减：带上读到的 version，版本对不上则影响行数为 0 行 
     int affected = couponMapper.decrementRemainingCount(couponCode, coupon.getVersion());
     if (affected == 0) {
-        throw BizException.conflict("优惠券库存不足，请稍后再试");
+        // 不是简单的抛库存不够
+        throw classifyDeductFailure(couponCode, coupon);
     }
 
     // 发放到用户账户：走 BaseMapper.insert，触发雪花主键填充
@@ -77,7 +77,25 @@ public boolean acquireCoupon(String userId, String couponCode) {
 }
 ```
 
-领券的流程：
+##### 短窗口 Redis 幂等键去重失败了怎么办？有什么兜底机制吗？
+
+短窗口 Redis 幂等键：coupon:acquire:{userId}:{couponCode}；值 "1"(占位标记)；写入方式 SETNX；10 s TTL
+
+失败了有兜底机制：领券最后一步 issuToUser 是往 user_coupon 表里插一条持券记录，而 user_coupon 表上有一个唯一索引 (user_id, coupon_code)，因此重复插入同一用户同一张券的记录会失败
+
+##### 库存键
+
+coupon:stock:{couponCode}，存储的是  Redis String 类型的计数器，通过 INCR/DECR 增减
+
+##### DB 乐观锁扣减库存 SQL——decrementRemainingCount
+
+```sql
+UPDATE coupon
+SET remaining_count = remaining_count - 1, version = version + 1
+WHERE coupon_code = #{couponCode} AND remaining_count > 0 AND version = #{version}
+```
+
+##### 领券的流程：
 
 1.业务幂等查库：
 
@@ -89,7 +107,7 @@ public boolean acquireCoupon(String userId, String couponCode) {
 
 3.读券模板并校验：
 
-查 `coupon` 表。券不存在或 `remaining_count <= 0` → 拒绝；已过 `end_time` → 拒绝。
+查 `coupon` 表。券不存在/ `remaining_count <= 0` /已过 `end_time` 直接拒绝。
 
 4.回源播种：
 
@@ -97,7 +115,7 @@ Redis 库存键不存在时，用 `SETNX` 按 DB 余量把它建起来；已存�
 
 5.Redis 预扣：
 
-`decrement` 库存计数减 1；结果为负说明已抢光，先 `increment` 把刚减的加回去，再抛 "优惠券已抢光"。
+`decrement` 库存计数减 1。结果为负说明已抢光，先 `increment` 把刚减的加回去，再抛 "优惠券已抢光"。
 
 6.注册回滚补偿回调：
 
@@ -105,7 +123,7 @@ Redis 库存键不存在时，用 `SETNX` 按 DB 余量把它建起来；已存�
 
 7.DB 乐观锁扣减：
 
-带读到的 `version` 执行条件 UPDATE，影响 0 行（版本冲突或余量不足）→ 拒绝 "库存不足"。
+带读到的 `version` 执行条件 UPDATE，影响 0 行（版本冲突或余量不足）就拒绝，根据实际情况抛出对应错误。
 
 8.发放到用户账户
 
@@ -114,10 +132,8 @@ Redis 库存键不存在时，用 `SETNX` 按 DB 余量把它建起来；已存�
 ### 下单用券核销——applyToOrder
 
 ```java
-/**
- * 下单用券：校验 + 核销，返回本笔订单的抵扣额。
- * 校验全部 fail-closed：任一不满足即抛异常，不悄悄按原价放行。
- */
+// 下单用券：校验 + 核销，返回本笔订单的抵扣额。
+// 校验全部 fail-closed：任一不满足即抛异常，不悄悄按原价放行。
 @Transactional(rollbackFor = Exception.class)
 public BigDecimal applyToOrder(String userId, String couponCode,
                                BigDecimal orderTotal, String orderNo) {
@@ -156,7 +172,7 @@ public BigDecimal applyToOrder(String userId, String couponCode,
         throw BizException.badParam("优惠券已过期: " + couponCode);
     }
 
-    // 核销：条件 UPDATE（status 0→1，绑定订单号），并发下唯一裁决点，判据是受影响行数
+    // 核销：条件 UPDATE（status 0→1，绑定订单号）
     // 排在所有校验之后：注定失败的调用不该先把券锁成已使用
     int marked = userCouponMapper.markUsed(userId, couponCode, orderNo, LocalDateTime.now());
     if (marked == 0) {
@@ -177,6 +193,18 @@ public BigDecimal applyToOrder(String userId, String couponCode,
     return applied;
 }
 ```
+
+##### 核销 SQL——markUsed
+
+```sql
+UPDATE user_coupon
+SET status = 1, used_time = #{usedTime}, order_no = #{orderNo}
+WHERE user_id = #{userId} AND coupon_code = #{couponCode} AND status = 0
+```
+
+##### 流程
+
+先查券是否存在，再校验券的类型、门槛、有效期，校验通过后核销，更新 user_coupon 表的相关内容，实付 = 总额 - 优惠券面额，上钳到不低于 0.01，避免抵扣成负价或零价，实际抵扣额 = 总额 - 实付，保留两位、四舍五入
 
 ### 退券——returnForOrder
 
@@ -215,7 +243,15 @@ public void returnForOrder(String couponCode, String orderNo) {
 }
 ```
 
-退券流程：
+##### 退券 SQL——markReturned
+
+```sql
+UPDATE user_coupon
+SET status = #{toStatus}, used_time = NULL, order_no = NULL
+WHERE coupon_code = #{couponCode} AND order_no = #{orderNo} AND status = 1
+```
+
+##### 退券流程：
 
 1.空券码直接返回：`couponCode` 为空说明这单没用券，不查库、不改状态，直接结束。
 
@@ -236,7 +272,7 @@ public void returnForOrder(String couponCode, String orderNo) {
 ```java
 public class CouponStockReconcileScheduler {
 
-    // Redis 库存键前缀，完整键 = coupon:stock:{券码}
+    // Redis 库存键
     private static final String STOCK_KEY_PREFIX = "coupon:stock:";
 
     // 单轮最多扫描的券数量，防止一次把整表捞出来压垮数据库
@@ -347,7 +383,6 @@ public class CouponStockReconcileScheduler {
             }
 
             // 播种失败：说明有人刚播种或刚领券，本轮不动，下一轮重新观测
-            // 为什么...会造成播种失败
             return Outcome.CAS_LOST;
         }
 
@@ -357,7 +392,6 @@ public class CouponStockReconcileScheduler {
             redisCount = Long.parseLong(raw);
         } catch (NumberFormatException e) {
             // 值损坏（非数字）：当成确定偏差，直接走修复
-            // 怎么修复？
             log.warn("[Coupon] corrupt stock key | code={} | value={}", code, raw);
             return repair(key, code, raw, dbCount);
         }
@@ -421,84 +455,32 @@ public class CouponStockReconcileScheduler {
 }
 ```
 
-### 单张券的判断流程——reconcileOne
+##### 对账分页查询 SQL——selectActivePageForReconcile
 
-```java
-// 对账单张券
-private Outcome reconcileOne(Coupon coupon) {
-    // 取券码和 DB 权威余量
-    String code = coupon.getCouponCode();
-    Integer dbCount = coupon.getRemainingCount();
-
-    // 券码为空、余量为空或为负：数据异常，按一致处理，不做任何改动
-    if (code == null || code.isBlank() || dbCount == null || dbCount < 0) {
-        return Outcome.IN_SYNC;
-    }
-
-    // 拼出这张券的 Redis 库存键
-    String key = STOCK_KEY_PREFIX + code;
-
-    // 读 Redis 当前计数（字符串形式）
-    String raw = redisTemplate.opsForValue().get(key);
-
-    if (raw == null) {
-        // SETNX：键不存在才写入，已存在则不覆盖
-        Boolean seeded = redisTemplate.opsForValue()
-                .setIfAbsent(key, String.valueOf(dbCount));
-
-        // 播种成功
-        if (Boolean.TRUE.equals(seeded)) {
-            log.info("[Coupon] stock key re-seeded | code={} | remaining={}", code, dbCount);
-            return Outcome.SEEDED;
-        }
-
-        // 播种失败：说明有人刚播种或刚领券，本轮不动，下一轮重新观测
-        return Outcome.CAS_LOST;
-    }
-
-    // 把 Redis 字符串解析成数字
-    long redisCount;
-    try {
-        redisCount = Long.parseLong(raw);
-    } catch (NumberFormatException e) {
-        // 值损坏（非数字）：当成确定偏差，直接走修复
-        log.warn("[Coupon] corrupt stock key | code={} | value={}", code, raw);
-        return repair(key, code, raw, dbCount);
-    }
-
-    // Redis 与 DB 一致：清掉历史偏差记录，返回一致
-    if (redisCount == dbCount) {
-        pendingDrift.remove(code);
-        return Outcome.IN_SYNC;
-    }
-
-    // 拼本轮偏差签名："redis值->db值"
-    String signature = raw + "->" + dbCount;
-
-    // 把签名存入 map，同时取出上一轮的旧签名
-    String previous = pendingDrift.put(code, signature);
-
-    // 与上一轮签名不同：第一次看到这个偏差，可能是在途事务，先记下，下一轮再确认
-    if (!signature.equals(previous)) {
-        log.warn("[Coupon] stock drift observed, will repair if it persists "
-                        + "| code={} | redis={} | db={}",
-                code, redisCount, dbCount);
-        return Outcome.DEFERRED;
-    }
-
-    // 连续两轮同一偏差：认定为真偏差，执行修复
-    Outcome outcome = repair(key, code, raw, dbCount);
-
-    // 修复成功才清掉偏差记录；没修成就留着，下一轮继续比对
-    if (outcome == Outcome.REPAIRED) {
-        pendingDrift.remove(code);
-    }
-    return outcome;
-}
+```sql
+SELECT id, coupon_code, remaining_count
+FROM coupon
+WHERE id > #{cursor} AND (end_time IS NULL OR end_time > #{now})
+ORDER BY id LIMIT #{limit}
 ```
 
-为什么领券会造成播种失败：
-领券路径先调 `seedStockFromDbIfAbsent`，用 `SETNX` 按 DB 余量把库存键建出来，已经有了库存键导致播种失败
+##### 为什么领券会造成播种失败
+
+领券路径先调 `seedStockFromDbIfAbsent`，用 `SETNX` 按 DB 余量把库存键建出来，已经有了库存键就会导致播种失败，因为播种写入用的是 `setIfAbsent`(播种是指 "Redis 中还没有相关库存键时从 DB 里读到权威数据写入 Redis")
+
+##### 对账流程
+
+1.定时触发+抢租约：
+
+每 10 分钟触发一次。多台实例都会被叫醒，但先用 Redis 租约抢一把，同一时刻只有抢到的那台执行，其余跳过，避免重复扫描重复写。
+
+2.分页扫券：
+
+按 id 游标一页取 500 张未过期券，一页一页推进，避免一次把整表捞出来压垮数据库；扫到末尾游标归零，下一轮从头开始。
+
+3.逐张券对比：
+
+每张券拿 Redis 当前计数和 DB 余量对比，分五种情况处理
 
 | 情况 | 处理 | 结果 |
 |------|------|------|
@@ -508,79 +490,25 @@ private Outcome reconcileOne(Coupon coupon) {
 | 第一次看到偏差 | 记入 pendingDrift，本轮不修 | DEFERRED |
 | 连续两轮同一偏差 | 执行 CAS 修复 | repair |
 
-### 修复
+为什么连续两轮同一偏差才进行修复？
 
-```java
-// 用 Lua CAS 把 Redis 值修到 DB 权威值
-private Outcome repair(String key, String code, String observed, int dbCount) {
-    // 执行脚本：KEYS[1]=库存键，ARGV[1]=观测值，ARGV[2]=DB 新值；返回 1 改成功，0 未改
-    Long changed = redisTemplate.execute(
-            CAS_SET, List.of(key), observed, String.valueOf(dbCount));
+因为领券是先扣 Redis 再提交 DB，修复则是以 DB 侧数据为准，两步之间有一个短暂窗口，如果出现一次不一致就改的话反而会把 Redis 改错
 
-    // 返回 1：当前值仍是观测值，已成功写成 DB 值
-    if (Long.valueOf(1L).equals(changed)) {
-        log.info("[Coupon] stock repaired | code={} | redis:{} -> {}",
-                code, observed, dbCount);
-        return Outcome.REPAIRED;
-    }
+4.修复用 Lua CAS，不直接覆盖
 
-    // 返回 0：观测之后又有领券或他人修过，值已变；本轮放弃，下一轮重新观测
-    log.info("[Coupon] stock repair skipped, value changed since observation | code={}", code);
-    return Outcome.CAS_LOST;
-}
-```
+修的时候先确认 "当前值还是我刚才看到的那个值"，是才写成 DB 值；如果这期间又有人领券扣过，就放弃本轮，下轮重新看。
 
-##### lua 脚本
+为什么要 "确认当前值还是我刚才看到的那个值"?
 
-```java
-private static final DefaultRedisScript<Long> CAS_SET = new DefaultRedisScript<>(
-        "local current = redis.call('GET', KEYS[1]) " +
-                "if current == ARGV[1] then " +
-                "  redis.call('SET', KEYS[1], ARGV[2]) " +
-                "  return 1 " +
-                "end " +
-                "return 0",
-        Long.class);
-```
+因为确认修复和开始修复两步有时间差，期间可能又有并发领券把 Redis 计数扣减，若直接按旧观测值覆盖写回 DB 值，会把这期间刚扣掉的额度又还回市场，造成重复放券。
 
-先判断现在的值和之前观测的值是否相同，如果不相同证明观测之后又有领券或他人修过，本轮放弃
+5.计数汇总 + 异常隔离
 
-## SQL
+各类结果计数打一条日志；单张券出异常（比如 Redis 抖动）只记日志，不影响同批其他券。
 
-### 乐观锁扣减余量——decrementRemainingCount
+## 券过期
 
-```sql
-UPDATE coupon
-SET remaining_count = remaining_count - 1, version = version + 1
-WHERE coupon_code = #{couponCode} AND remaining_count > 0 AND version = #{version}
-```
-
-### 对账分页查询——selectActivePageForReconcile
-
-```sql
-SELECT id, coupon_code, remaining_count
-FROM coupon
-WHERE id > #{cursor} AND (end_time IS NULL OR end_time > #{now})
-ORDER BY id LIMIT #{limit}
-```
-
-### 核销——markUsed
-
-```java
-UPDATE user_coupon
-SET status = 1, used_time = #{usedTime}, order_no = #{orderNo}
-WHERE user_id = #{userId} AND coupon_code = #{couponCode} AND status = 0
-```
-
-### 退券——markReturned
-
-```sql
-UPDATE user_coupon
-SET status = #{toStatus}, used_time = NULL, order_no = NULL
-WHERE coupon_code = #{couponCode} AND order_no = #{orderNo} AND status = 1
-```
-
-### 过期扫描——markExpired
+### 过期扫描 SQL——markExpired
 
 ```sql
 UPDATE user_coupon uc
