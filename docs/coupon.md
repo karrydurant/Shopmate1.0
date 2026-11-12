@@ -77,6 +77,40 @@ public boolean acquireCoupon(String userId, String couponCode) {
 }
 ```
 
+领券的流程：
+
+1.业务幂等查库：
+
+按 `userId + couponCode` 查 `user_coupon`，已领过直接抛 "您已领取过该优惠券"。这是长期约束，保证同一张券一人一份。
+
+2.短窗口并发去重：
+
+写 Redis 幂等键 `coupon:acquire:{userId}:{couponCode}`，`SETNX` + 10 秒 TTL；写不进去说明同用户同券有并发重复请求，快速拒绝 "操作过于频繁"。
+
+3.读券模板并校验：
+
+查 `coupon` 表。券不存在或 `remaining_count <= 0` → 拒绝；已过 `end_time` → 拒绝。
+
+4.回源播种：
+
+Redis 库存键不存在时，用 `SETNX` 按 DB 余量把它建起来；已存在则不覆盖。必须在预扣之前做，避免冷启动把券误判成抢光。
+
+5.Redis 预扣：
+
+`decrement` 库存计数减 1；结果为负说明已抢光，先 `increment` 把刚减的加回去，再抛 "优惠券已抢光"。
+
+6.注册回滚补偿回调：
+
+登记事务同步：事务一旦回滚，把 Redis 预扣的库存加回去、删掉幂等键。
+
+7.DB 乐观锁扣减：
+
+带读到的 `version` 执行条件 UPDATE，影响 0 行（版本冲突或余量不足）→ 拒绝 "库存不足"。
+
+8.发放到用户账户
+
+`issueToUser` 往 `user_coupon` 插入一条未使用券记录，打成功日志，返回 `true`
+
 ### 下单用券核销——applyToOrder
 
 ```java
@@ -180,6 +214,22 @@ public void returnForOrder(String couponCode, String orderNo) {
     }
 }
 ```
+
+退券流程：
+
+1.空券码直接返回：`couponCode` 为空说明这单没用券，不查库、不改状态，直接结束。
+
+2.查券模板，判断是否已过期
+
+3.未过期 → 退成 `0`（未使用）；已过期 → 退成 `2`（已过期）
+
+4.带条件(status=1) UPDATE 退回
+
+5.按影响行数分流：
+
+0 行代表：这单没用过券，或券已经退过一次 → 幂等空操作，只留痕、不抛异常
+
+1 行代表：退回成功，记录券码、订单号、目标状态
 
 ## 对账——CouponStockReconcileScheduler
 
