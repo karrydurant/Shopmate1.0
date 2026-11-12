@@ -519,22 +519,38 @@ private void registerIdempotencyFinalizer(String key, String orderNo) {
 
 ##### orders 订单主表
 
-| 字段 | 类型 | 约束/索引 | 说明 |
-|------|------|-----------|------|
-| id | BIGINT | 主键 PK | 订单 ID |
-| order_no | VARCHAR(64) | NOT NULL，UNIQUE uk_order_no | 订单号 |
-| user_id | VARCHAR(64) | NOT NULL，INDEX idx_user_id | 用户 ID |
-| total_amount | DECIMAL(10,2) | NOT NULL | 订单总金额 |
-| discount_amount | DECIMAL(10,2) | DEFAULT 0 | 优惠金额 |
-| pay_amount | DECIMAL(10,2) | NOT NULL | 实付金额 |
-| status | TINYINT | DEFAULT 0 | 0待支付/1已支付/2已发货/3已收货/4完成/5已取消/6退款中/7已退款/8退货中/9已退货入库 |
-| address_snapshot | JSON | — | 地址快照 |
-| coupon_code | VARCHAR(64) | — | 使用的优惠券码 |
-| request_id | VARCHAR(64) | — | 客户端幂等键 |
-| source | VARCHAR(32) | DEFAULT agent_guide | 订单来源 |
-| session_id | VARCHAR(64) | — | 导购会话 ID |
-| create_time | DATETIME | DEFAULT CURRENT_TIMESTAMP | 创建时间 |
-| update_time | DATETIME | ON UPDATE CURRENT_TIMESTAMP | 更新时间 |
-| deleted | TINYINT(1) | DEFAULT 0 | 逻辑删除 |
-| 唯一索引 | — | UNIQUE uk_user_request | (user_id, request_id)，下单幂等兜底 |
-| 联合索引 | — | INDEX idx_status_create_time | (status, create_time)，服务超时扫描 |
+| 字段 | 类型 | 约束 | 索引 | 说明 |
+|------|------|------------------------|----------------------|------|
+| id | BIGINT | PRIMARY KEY (非空 + 全表唯一) | 主键索引 | 订单 ID |
+| order_no | VARCHAR(64) | NOT NULL, UNIQUE (不许重复) | uk_order_no 唯一索引 (UNIQUE KEY uk_order_no (order_no)) | 订单号 |
+| user_id | VARCHAR(64) | NOT NULL | idx_user_id 普通索引 (INDEX idx_user_id (user_id)) , 同时是 uk_user_request 的前导列(指的是联合索引的第一列) | 用户 ID |
+| total_amount | DECIMAL(10,2) | NOT NULL | — | 订单总金额 |
+| discount_amount | DECIMAL(10,2) | DEFAULT 0（没传就填 0） | — | 优惠金额 |
+| pay_amount | DECIMAL(10,2) | NOT NULL | — | 实付金额 |
+| status | TINYINT | DEFAULT 0（默认待支付） | 是 idx_status_create_time 的前导列 | 0待支付/1已支付/2已发货/3已收货/4完成/5已取消/6退款中/7已退款/8退货中/9已退货入库 |
+| address_snapshot | JSON | 可空 | — | 地址快照 |
+| coupon_code | VARCHAR(64) | DEFAULT NULL（可空） | — | 使用的优惠券码 |
+| request_id | VARCHAR(64) | DEFAULT NULL | 是 uk_user_request 的第二列 | 客户端幂等键 |
+| source | VARCHAR(32) | DEFAULT 'agent_guide' | — | 订单来源 |
+| session_id | VARCHAR(64) | DEFAULT NULL（可空） | — | 导购会话 ID |
+| create_time | DATETIME | DEFAULT CURRENT_TIMESTAMP（**实际代码不用，应用层 `LocalDateTime.now()` 手动写**，避时钟漂移） | 是 idx_status_create_time 的第二列 | 创建时间 |
+| update_time | DATETIME | DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP（行被改时自动刷新） | — | 更新时间 |
+| deleted | TINYINT(1) | DEFAULT 0 | — | 逻辑删除 |
+
+两个索引：
+
+联合唯一索引 (user_id, request_id)，为下单幂等兜底
+
+联合普通索引 (status, create_time)，用于超时扫描
+
+##### order_item 订单明细
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | BIGINT PK | 雪花 ID（无自增，批量插入时手动分配） |
+| order_id | BIGINT，INDEX idx_order_id | 所属订单 |
+| product_id | VARCHAR(64) | 商品 ID（注意：跟 product_sku.id 的 BIGINT 不一致，是历史遗留） |
+| sku_id | BIGINT | SKU ID |
+| product_name / sku_desc | VARCHAR | 下单时从 SKU 快照，商品改名不影响历史订单 |
+| quantity | INT | 数量 |
+| price / total_price | DECIMAL(10,2) | 单价 / 小计 |
