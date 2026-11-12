@@ -542,36 +542,35 @@ WHERE uc.status = 0
 
 ### 优惠券相关的数据库表是怎么样的？`coupon` 和 `user_coupon` 两张表怎么分工？关键字段和约束是什么？
 
-##### coupon：定义券是什么、还剩多少
+##### coupon：定义券是什么？还剩多少？
 
-| 字段 | 类型 | 约束/索引 | 说明 |
-|------|------|-----------|------|
-| id | BIGINT | 主键 PK | 主键 |
-| coupon_code | VARCHAR(64) | NOT NULL，UNIQUE uk_coupon_code | 优惠券码 |
-| title | VARCHAR(128) | NOT NULL | 标题 |
-| type | TINYINT | DEFAULT 0 | 0满减 / 1折扣 / 2立减 |
-| condition_amount | DECIMAL(10,2) | — | 满减门槛（立减为 0） |
-| discount_amount | DECIMAL(10,2) | — | 减免金额（折扣券为折扣率） |
-| total_count | INT | DEFAULT 0 | 总发放量 |
-| remaining_count | INT | DEFAULT 0 | 剩余可领量 |
-| version | INT | DEFAULT 0 | 乐观锁版本号 |
-| start_time | DATETIME | — | 有效期开始 |
-| end_time | DATETIME | — | 有效期结束 |
-| create_time | DATETIME | DEFAULT CURRENT_TIMESTAMP | 创建时间 |
-| update_time | DATETIME | ON UPDATE CURRENT_TIMESTAMP | 更新时间 |
+| 字段 | 类型 | 索引 | 约束 |说明 |
+| ---- | ---- |---- | ---- | ---- |
+| id | BIGINT | 主键也算索引 | 主键约束：唯一+非空 | 主键 |
+| coupon_code | VARCHAR(64) | UNIQUE KEY uk_coupon_code (coupon_code) | 非空、不重复 | 优惠券码 |
+| title | VARCHAR(128) |  | 非空 | 标题 |
+| type | TINYINT |  | 默认0 | 0满减 / 1折扣 / 2立减 |
+| condition_amount | DECIMAL(10,2) |  |  | 满减门槛 |
+| discount_amount | DECIMAL(10,2) |  |  | 减免金额 |
+| total_count | INT |  | 默认0 | 总发放量 |
+| remaining_count | INT |  | 默认0 | 剩余可领量 |
+| version | INT |  | 默认0 | 乐观锁版本号 |
+| start_time | DATETIME |  |  | 有效期开始 |
+| end_time | DATETIME |  |  | 有效期结束 |
+| create_time | DATETIME |  | 插入时默认当前时间 | 创建时间 |
+| update_time | DATETIME |  | 这一行被更新时默认当前时间 | 更新时间 |
 
 ##### user_coupon：用户持有表（谁领了、用没用、绑哪笔单）
 
-| 字段 | 类型 | 约束/索引 | 说明 |
-|------|------|-----------|------|
-| id | BIGINT | 主键 PK | 主键 |
-| user_id | VARCHAR(64) | NOT NULL | 用户 ID |
-| coupon_code | VARCHAR(64) | NOT NULL，INDEX idx_coupon_code | 优惠券码 |
-| status | TINYINT | DEFAULT 0 | 0未使用 / 1已使用 / 2已过期 |
-| acquire_time | DATETIME | — | 领取时间 |
-| used_time | DATETIME | — | 使用时间 |
-| order_no | VARCHAR(64) | — | 绑定订单号 |
-| 唯一索引 | — | UNIQUE uk_user_coupon (user_id, coupon_code) | 一人限领一张 |
+| 字段 | 类型 | 索引 | 约束 | 含义与作用 |
+|---|---|---|---|---|
+| id | BIGINT | 主键索引（聚簇索引） | 主键约束：唯一 + 非空 | 主键；雪花算法由应用生成 |
+| user_id | VARCHAR(64) | 联合唯一索引 `uk_user_coupon(user_id, coupon_code)` | `NOT NULL` | 持券用户 ID |
+| coupon_code | VARCHAR(64) | 联合唯一索引 `uk_user_coupon(user_id, coupon_code)`；普通二级索引 `idx_coupon_code(coupon_code)` | `NOT NULL` | 券码，关联 `coupon` 模板 |
+| status | TINYINT | 无 | 默认 `0` | 状态：`0 未使用` / `1 已使用` / `2 已过期` |
+| acquire_time | DATETIME | 无 | `DEFAULT CURRENT_TIMESTAMP` | 领取时间 |
+| used_time | DATETIME | 无 | 可空，默认 `NULL` | 使用时间，退券时清空 |
+| order_no | VARCHAR(64) | 无 | 可空，默认 `NULL` | 绑定订单号，退券时清空 |
 
 ### 高并发领券怎么防止超发？库存扣减怎么做的？
 
@@ -634,13 +633,21 @@ Redis 幂等键只存活很短一段时间就自动过期(10 s)
 
 ##### 那什么情况要使用分布式锁？
 
-分布式锁的适用场景
-
-1.跨服务 / 跨多个数据源：同一资源分散在多个微服务、多个库，单行锁只锁得住本库一行，管不到别的库和服务，需要全局锁协调
+1.跨服务 / 跨多个数据源
 
 2.全局只能一个实例执行
 
-为什么不轻易上分布式锁：
+3.一段业务流程要读 - 判断 - 写多行、跨多个步骤，需要在整个流程期间独占
+
+##### 为什么不轻易上分布式锁：
+
+上分布式锁会造成下述问题：
+
+1.把并发全局串行化，牺牲吞吐：分布式锁让本该由各自行锁并行处理的请求排队走一个全局临界区
+
+2.死锁 / 锁泄漏风险：持锁进程宕机、忘记释放、锁提前过期，都会导致资源被长期占住
+
+3.容易把长事务 / 多次往返藏进锁里：拿到锁后再做网络调用、多次 DB 读写，临界区被拉长
 
 ### 一张券能不能同时抵两笔订单？并发两笔下单用同一张券怎么处理？为什么不先查后改？
 
@@ -665,3 +672,23 @@ Redis 幂等键只存活很短一段时间就自动过期(10 s)
 2.回调里的 Redis 操作失败：Redis 抖动、超时、网络断开。
 
 对账修复是定时任务把 "Redis 预扣计数" 和 "DB 权威余量" 逐张比对，发现偏差后以 DB 为准修回 Redis(具体细节见上)。
+
+### 项目当前是一单最多一券，如果允许叠加券你会怎么处理？
+
+##### 先定规则
+
+##### 数据怎么存
+
+可以单独建一张 "订单用券明细表"，一行记录这单用了哪张券、抵了多少钱：
+
+订单号、用户、券码、这张券当时减了多少、面额和类型快照，同一订单里同一张券不能重复记录。
+
+券模板表再补几个规则字段：是否可叠加、属于哪个互斥组、最多用几张、适用范围、计算顺序。
+
+##### 选出最划算的组合
+
+算法，略
+
+##### 怎么保证多张券不会用乱？
+
+所有券放在同一个数据库事务里批量核销，
