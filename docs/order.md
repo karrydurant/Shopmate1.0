@@ -144,6 +144,12 @@ public Order createOrder(Order order, List<OrderItem> items, String requestId) {
 }
 ```
 
+##### 创建订单的流程
+
+1.校验：用户身份、订单项不能为空，每个 SKU 与数量都必须合法
+
+2.
+
 ### 支付——payOrder
 
 ```java
